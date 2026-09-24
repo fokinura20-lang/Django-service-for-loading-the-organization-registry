@@ -1,0 +1,14 @@
+files: '^backend/.*\.py$'
+exclude: '^(venv.*|env/.*|.*/migrations/.*|.*/__init__\.py)$'
+
+default_stages: [pre-commit, pre-push]
+
+repos:
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  rev: v0.12.7
+  hooks:
+    - id: ruff
+      args: ["--config=pyproject.toml", "--fix", "--exit-non-zero-on-fix", --ignore, "E402,F811,I001,I002"]
+      exclude: '^(venv.*|env/.*|.*/__init__\.py|backend/industry/tests_settings\.py)$'
+    - id: ruff-format
+      args: ["--config=pyproject.toml"]
