@@ -1,68 +1,98 @@
 import csv
+import re
 from datetime import datetime
-from django.core.management.base import BaseCommand
-from django.db import transaction, IntegrityError
+
+from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
 from django.utils import timezone
+
 from organizations.models import Organization, FileLoad, LoadError
 
 
 class Command(BaseCommand):
-    help = "Загрузка организаций из CSV-файла"
+    help = "Загрузка организаций из CSV-файла с валидацией и обработкой дубликатов"
 
     def add_arguments(self, parser):
         parser.add_argument("filepath", type=str, help="Путь к CSV-файлу")
+        parser.add_argument(
+            "--clear", action="store_true", help="Очистить справочник перед загрузкой (режим полной замены)"
+        )
 
     def handle(self, *args, **options):
         filepath = options["filepath"]
+        clear_db = options["clear"]
 
-        # Проверка существования файла
+        # НОВАЯ ФИЧА: Проверка на параллельные загрузки (Правило: блокировать, если есть PROCESSING)
+        if FileLoad.objects.filter(status="PROCESSING").exists():
+            raise CommandError(
+                "Загрузка прервана: уже выполняется другая загрузка со статусом PROCESSING. "
+                "Дождитесь её завершения или используйте флаг --clear для принудительного перезапуска."
+            )
+
+        # 1. Немедленно создаём запись FileLoad
+        file_load = FileLoad.objects.create(filename=filepath, status="PROCESSING", started_at=timezone.now())
+
         try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                pass
-        except FileNotFoundError:
-            self.stderr.write(self.style.ERROR(f"Файл не найден: {filepath}"))
-            return
+            if clear_db:
+                self.stdout.write(self.style.WARNING("ВНИМАНИЕ: Очистка существующих организаций..."))
+                Organization.objects.all().delete()
 
-        # Создание записи FileLoad
-        file_load = FileLoad.objects.create(filename=filepath, status="PROCESSING")
+            # 2. Безопасное чтение файла
+            try:
+                with open(filepath, "r", encoding="utf-8-sig") as f:
+                    reader = csv.DictReader(f, delimiter=";")
 
-        loaded = 0
-        errors = 0
-        duplicates = 0
-        total = 0
+                    # 3. Проверка заголовков
+                    expected_headers = {"inn", "name", "region", "employees", "registration_date"}
+                    if not reader.fieldnames or set(reader.fieldnames) != expected_headers:
+                        raise ValueError(
+                            f"Неверные заголовки CSV. "
+                            f"Ожидались: {expected_headers}, "
+                            f"получены: {set(reader.fieldnames) if reader.fieldnames else 'None'}"
+                        )
 
-        with open(filepath, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f, delimiter=";")
+                    rows = list(reader)
+            except FileNotFoundError:
+                raise CommandError(f"Файл не найден: {filepath}")
+            except PermissionError:
+                raise CommandError(f"Нет прав на чтение файла: {filepath}")
+            except UnicodeDecodeError:
+                raise CommandError("Ошибка кодировки файла. Ожидается UTF-8 (с BOM или без).")
+            except csv.Error as e:
+                raise CommandError(f"Ошибка парсинга CSV: {e}")
+            except Exception as e:
+                raise CommandError(f"Критическая ошибка при чтении файла: {e}")
 
-            for row_num, row in enumerate(reader, start=2):
-                total += 1
-                raw_data = ";".join(row.values())
+            total = len(rows)
+            loaded = 0
+            errors = 0
+            duplicates = 0
+
+            # 4. Первый проход: подсчёт вхождений ИНН в текущем файле
+            inn_counts = {}
+            for row in rows:
+                inn = str(row.get("inn", "")).strip()
+                if re.match(r"^\d{10}$", inn):
+                    inn_counts[inn] = inn_counts.get(inn, 0) + 1
+
+            # 5. Второй проход: валидация и сохранение
+            for row_num, row in enumerate(rows, start=2):
+                raw_data = ";".join("" if v is None else str(v) for v in row.values())
                 error_messages = []
 
-                # Получение значений
-                inn = row.get("inn", "").strip()
-                name = row.get("name", "").strip()
-                region = row.get("region", "").strip()
-                employees_str = row.get("employees", "").strip()
-                date_str = row.get("registration_date", "").strip()
+                inn = str(row.get("inn", "")).strip()
+                name = str(row.get("name", "")).strip()
+                region = str(row.get("region", "")).strip()
+                employees_str = str(row.get("employees", "")).strip()
+                date_str = str(row.get("registration_date", "")).strip()
 
-                # Валидация ИНН
-                if not inn:
-                    error_messages.append("ИНН не заполнен")
-                elif not inn.isdigit():
-                    error_messages.append("ИНН содержит нецифровые символы")
-                elif len(inn) != 10:
-                    error_messages.append(f"ИНН должен содержать 10 цифр, сейчас {len(inn)}")
-
-                # Валидация названия
+                if not re.match(r"^\d{10}$", inn):
+                    error_messages.append("ИНН должен содержать ровно 10 цифр")
                 if not name:
                     error_messages.append("Наименование не заполнено")
-
-                # Валидация региона
                 if not region:
                     error_messages.append("Регион не заполнен")
 
-                # Валидация сотрудников
                 employees = None
                 if not employees_str:
                     error_messages.append("Количество сотрудников не заполнено")
@@ -74,55 +104,79 @@ class Command(BaseCommand):
                     except ValueError:
                         error_messages.append("Количество сотрудников не является целым числом")
 
-                # Валидация даты
                 reg_date = None
                 if not date_str:
                     error_messages.append("Дата регистрации не заполнена")
                 else:
-                    try:
-                        reg_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-                    except ValueError:
-                        error_messages.append("Некорректный формат даты (ожидается YYYY-MM-DD)")
+                    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+                        error_messages.append("Некорректный формат даты (ожидается строго YYYY-MM-DD)")
+                    else:
+                        try:
+                            reg_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                        except ValueError:
+                            error_messages.append("Некорректная дата (например, 30 февраля)")
 
-                # Если есть ошибки валидации - сохраняем в LoadError
+                if re.match(r"^\d{10}$", inn) and inn_counts.get(inn, 0) > 1:
+                    error_messages.append("Повтор ИНН в текущем файле")
+
                 if error_messages:
                     errors += 1
+                    if "Повтор ИНН в текущем файле" in error_messages:
+                        duplicates += 1
+
                     LoadError.objects.create(
                         load=file_load, row_number=row_num, raw_data=raw_data, error_message="; ".join(error_messages)
                     )
                     continue
 
-                # Попытка сохранить организацию с обработкой дубликатов через savepoint
                 try:
                     with transaction.atomic():
-                        Organization.objects.create(
-                            inn=inn, name=name, region=region, employees=employees, registration_date=reg_date
+                        Organization.objects.update_or_create(
+                            inn=inn,
+                            defaults={
+                                "name": name,
+                                "region": region,
+                                "employees": employees,
+                                "registration_date": reg_date,
+                            },
                         )
                         loaded += 1
-                except IntegrityError:
-                    # Дубликат ИНН
-                    duplicates += 1
+                except Exception as e:
+                    errors += 1
                     LoadError.objects.create(
-                        load=file_load, row_number=row_num, raw_data=raw_data, error_message=f"Дубликат ИНН: {inn}"
+                        load=file_load,
+                        row_number=row_num,
+                        raw_data=raw_data,
+                        error_message=f"Ошибка базы данных: {str(e)}",
                     )
 
-        # Обновляем FileLoad (вне основного цикла)
-        file_load.rows_count = total
-        file_load.loaded_count = loaded
-        file_load.error_count = errors
-        file_load.duplicate_count = duplicates
-        file_load.status = "SUCCESS"
-        file_load.finished_at = timezone.now()
-        file_load.save()
+            file_load.rows_count = total
+            file_load.loaded_count = loaded
+            file_load.error_count = errors
+            file_load.duplicate_count = duplicates
+            file_load.status = "SUCCESS"
+            file_load.finished_at = timezone.now()
+            file_load.save()
 
-        # Вывод статистики
-        self.stdout.write(
-            self.style.SUCCESS(f"""
-Файл: {filepath}
-Обработано строк: {total}
-Успешно загружено: {loaded}
-Ошибочных строк: {errors}
-Дубликатов: {duplicates}
-Статус: {file_load.status}
-""")
-        )
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"\nФайл: {filepath}\n"
+                    f"Обработано строк: {total}\n"
+                    f"Успешно загружено/обновлено: {loaded}\n"
+                    f"Ошибочных строк: {errors}\n"
+                    f"Дубликатов (в файле): {duplicates}\n"
+                    f"Статус: SUCCESS\n"
+                )
+            )
+
+        except CommandError:
+            file_load.status = "FAILED"
+            file_load.finished_at = timezone.now()
+            file_load.save()
+            raise
+        except Exception as e:
+            file_load.status = "FAILED"
+            file_load.finished_at = timezone.now()
+            file_load.save()
+            self.stdout.write(self.style.ERROR(f"\nКРИТИЧЕСКАЯ ОШИБКА: {e}"))
+            raise CommandError(f"Загрузка прервана из-за критической ошибки: {e}")
